@@ -482,6 +482,10 @@ bool NCPPGSSolver<T, C>::solve(const ContactProblem<T, C> &prob,
   if (settings.timings_) {
     timer_.start();
   }
+
+  // =========================================================================
+  // STEP 1: Solver Parameter Initialization
+  // =========================================================================
   max_iter_ = settings.max_iter_;
   th_stop_ = settings.th_stop_;
   rel_th_stop_ = settings.rel_th_stop_;
@@ -491,46 +495,77 @@ bool NCPPGSSolver<T, C>::solve(const ContactProblem<T, C> &prob,
   if (settings.statistics_) {
     stats_.reset();
   }
+
+  // =========================================================================
+  // STEP 2: Delassus Matrix Evaluation
+  // =========================================================================
+  // Compute Cholesky decomposition and evaluate the Delassus Matrix W (referred to as Del_).
+  // As described in Section III of the paper, W maps contact impulses to contact velocities: v = W * lam + g
   prob.Del_->computeChol(1e-9);
   prob.Del_->evaluateDel();
+
+  // =========================================================================
+  // STEP 3: Main Projected Gauss-Seidel (PGS) Iteration Loop
+  // =========================================================================
   for (int j = 0; j < max_iter_; j++) {
-    lam_pred_ = lam_;
+    lam_pred_ = lam_; // Store previous impulses to evaluate relative convergence later
+    // Loop over each individual contact point (nc_)
     for (int i = 0; i < nc_; i++) {
+      // ---------------------------------------------------------------------
+      // STEP 3.1: Update & Project NORMAL FORCE (Signorini Condition)
+      // ---------------------------------------------------------------------
+      // Compute the current normal velocity at the i-th contact point (v = W * lam)
       prob.Del_->applyPerContactNormalOnTheRight(i, lam_, v_(3 * i + 2));
       v_(3 * i + 2) += prob.g_(3 * i + 2);
       v_reg_(3 * i + 2) = v_(3 * i + 2);
+      // Local Gauss-Seidel update step for the normal component (Index 3*i + 2) using over-relaxation
       lam_(3 * i + 2) += -(over_relax / (prob.Del_->G_(3 * i + 2, 3 * i + 2))) *
                          (v_(3 * i + 2));
+      // PROJECTION (Signorini constraint): Rigid contacts can only push, never pull.
+      // If the force drops below zero, the robot is breaking contact -> clamp impulse to 0.
       if (lam_(3 * i + 2) < 0) {
         lam_(3 * i + 2) = 0;
       }
+      // ---------------------------------------------------------------------
+      // STEP 3.2: Update & Project TANGENTIAL FORCES (Coulomb Friction Law)
+      // ---------------------------------------------------------------------
+      // Determine the step size using the minimum diagonal entry of the Delassus matrix in the tangent plane
       T min_dxy = std::max(std::min(prob.Del_->G_(3 * i, 3 * i),
                                     prob.Del_->G_(3 * i + 1, 3 * i + 1)),
                            step_eps_);
-      lam_tmp_(2) = lam_(3 * i + 2);
+      lam_tmp_(2) = lam_(3 * i + 2);// Feed the newly updated normal force into the temporary vector
+
+      // Compute tangential velocities (slip/sliding velocity in local x and y directions)
       prob.Del_->applyPerContactTangentOnTheRight(
           i, lam_, v_.template segment<2>(3 * i));
       v_.template segment<2>(3 * i) += prob.g_.template segment<2>(3 * i);
       v_reg_.template segment<2>(3 * i) = v_.template segment<2>(3 * i);
+
+      // Local Gauss-Seidel update step for the two friction components
       lam_tmp_.template head<2>() =
           lam_.template segment<2>(3 * i) -
           (over_relax / min_dxy) * (v_.template segment<2>(3 * i));
+      // PROJECTION (Coulomb Friction Cone): Snaps the calculated tangential impulses back into the friction cone.
+      // The friction force magnitude is bounded by (normal force * friction coefficient mu).
+      // 'projectHorizontal' uses the updated normal force component as the strict limit.
       prob.contact_constraints_[CAST_UL(i)].projectHorizontal(
           lam_tmp_, lam_.template segment<3>(3 * i));
     }
+
+    // =========================================================================
+    // STEP 4: Convergence & Termination Criteria Check
+    // =========================================================================
+    // Compute the absolute residual (how well are the complementarity conditions satisfied?)
     stop_ = stoppingCriteria(prob, lam_, v_);
+    // Compute the relative residual (how much did the forces change compared to the last iteration?)
     rel_stop_ = relativeStoppingCriteria(lam_, lam_pred_);
-    // const bool convergence_criteria_reached =
-    //      check_expression_if_real<Scalar,false>(settings.absolute_residual <=
-    //      settings.absolute_accuracy)
-    //   || check_expression_if_real<Scalar,false>(settings.relative_residual <=
-    //   settings.relative_accuracy); if(convergence_criteria_reached) // In the
-    //   case where Scalar is not double, this will iterate for max_it.
-    //     break;
+
     if (settings.statistics_) {
       addStatistics(stop_, rel_stop_, ncp_comp_,
                     prob.computeSignoriniComplementarity(lam_, v_), dual_feas_);
     }
+
+    // If the error falls below the configured threshold, the solver has converged -> early exit!
     if (stop_ < th_stop_ || rel_stop_ < rel_th_stop_) {
       n_iter_ = j + 1;
       CONTACTBENCH_NOMALLOC_END;
@@ -540,6 +575,7 @@ bool NCPPGSSolver<T, C>::solve(const ContactProblem<T, C> &prob,
       return true;
     }
   }
+  // Maximum iterations reached without satisfying the tolerance thresholds
   n_iter_ = max_iter_;
   CONTACTBENCH_NOMALLOC_END;
   if (settings.timings_) {
@@ -1495,24 +1531,46 @@ bool CCPPGSSolver<T>::solve(ContactProblem<T, IceCreamCone> &prob,
   if (settings.timings_) {
     timer_.start();
   }
+  // =========================================================================
+  // STEP 1: Solver Parameter Initialization
+  // =========================================================================
   max_iter_ = settings.max_iter_;
   th_stop_ = settings.th_stop_;
   rel_th_stop_ = settings.rel_th_stop_;
-  lam_ = lam0;
+  lam_ = lam0;// Initial guess for contact impulses/forces (Lambda vector)
   Vector3s lam_tmp_;
   stop_ = std::numeric_limits<T>::max();
   if (settings.statistics_) {
     stats_.reset();
   }
+  // =========================================================================
+  // STEP 2: Matrix Setup
+  // =========================================================================
+  // Evaluate the Delassus Matrix W (referred to as Del_).
+  // Maps contact impulses to contact velocities: v = W * lam + g
   prob.Del_->computeChol(1e-9);
   prob.Del_->evaluateDel();
-  R_reg_ = R_reg;
+  R_reg_ = R_reg;// ?
+
+  // =========================================================================
+  // STEP 3: Main Projected Gauss-Seidel Iteration Loop (Convex Formulation)
+  // =========================================================================
   for (int j = 0; j < settings.max_iter_; j++) {
-    lam_pred_ = lam_;
+    lam_pred_ = lam_;// Store previous impulses to evaluate relative convergence later
+    // Loop over each individual contact point (nc_)
     for (int i = 0; i < nc_; i++) {
+      // Compute the unregularized contact velocity component: v = W * lam
       prob.Del_->applyPerContactOnTheRight(i, lam_,
                                            v_.template segment<3>(3 * i));
       v_.template segment<3>(3 * i) += prob.g_.template segment<3>(3 * i);
+
+      // ---------------------------------------------------------------------
+      // STEP 3.1: Proximal Regularization Insertion
+      // ---------------------------------------------------------------------
+      // Incorporate proximal and compliance regularization (R_reg_ and R_comp_).
+      // As noted in Section IV of the paper, this modifies the contact velocity to:
+      // v_reg = v + (R_reg + R_comp) * lam
+      // element-wise multiplication (.cwiseProduct) keeps it computationally efficient.
       v_reg_.template segment<3>(3 * i) =
           v_.template segment<3>(3 * i) +
           R_reg_.template segment<3>(3 * i).cwiseProduct(
@@ -1520,6 +1578,13 @@ bool CCPPGSSolver<T>::solve(ContactProblem<T, IceCreamCone> &prob,
       v_reg_.template segment<3>(3 * i) +=
           prob.R_comp_.template segment<3>(3 * i).cwiseProduct(
               lam_.template segment<3>(3 * i));
+
+      // ---------------------------------------------------------------------
+      // STEP 3.2: 3D Simultaneous Gauss-Seidel Step & Step-Size Scaling
+      // ---------------------------------------------------------------------
+      // Calculate an unconstrained trial force 'lam_tmp_'.
+      // The step-size scaling factor uses the average of the 3D trace of the Delassus matrix
+      // combined with the regularization terms to ensure numerical stability and monotonic descent.
       lam_tmp_ =
           lam_pred_.template segment<3>(3 * i) -
           (3. / std::max(prob.Del_->G_(3 * i, 3 * i) +
@@ -1530,9 +1595,18 @@ bool CCPPGSSolver<T>::solve(ContactProblem<T, IceCreamCone> &prob,
                              prob.R_comp_(3 * i + 1) + prob.R_comp_(3 * i + 2),
                          step_eps_)) *
               (v_reg_.template segment<3>(3 * i));
+
+      // ---------------------------------------------------------------------
+      // STEP 3.3: Second-Order Cone Projection
+      // ---------------------------------------------------------------------
+      // Project the unconstrained 3D impulse vector onto the convex IceCreamCone (Second-Order Cone).
+      // Maps the trial impulse 'lam_tmp_' directly to the closest point inside the friction cone.
       prob.contact_constraints_[CAST_UL(i)].project(
           lam_tmp_, lam_.template segment<3>(3 * i));
     }
+    // =========================================================================
+    // STEP 4: Convergence & Termination Criteria Check
+    // =========================================================================
     rel_stop_ = relativeStoppingCriteria(lam_, lam_pred_);
     stop_ = stoppingCriteria(
         prob, lam_,
@@ -1542,8 +1616,15 @@ bool CCPPGSSolver<T>::solve(ContactProblem<T, IceCreamCone> &prob,
       addStatistics(stop_, rel_stop_, comp_reg_, prim_feas_, dual_feas_reg_,
                     sig_comp_reg_, ncp_comp_reg_);
     }
+    // Check if the solution is accurate enough within configured tolerance
     if (stop_ < th_stop_ || rel_stop_ < rel_th_stop_) {
       n_iter_ = j + 1;
+
+      // ---------------------------------------------------------------------
+      // STEP 5: Polishing Phase (Optional Precision Booster)
+      // ---------------------------------------------------------------------
+      // If 'polish' is requested, the solver activates a Newton-like method on the
+      // active set of contacts to resolve precision limits of typical first-order PGS methods.
       if (polish) {
         bool success = this->_polish(prob, lam_, settings, R_reg);
         CONTACTBENCH_NOMALLOC_END;
@@ -1562,6 +1643,10 @@ bool CCPPGSSolver<T>::solve(ContactProblem<T, IceCreamCone> &prob,
       }
     }
   }
+
+  // =========================================================================
+  // STEP 6: Max Iterations Fallback
+  // =========================================================================
   if (settings.timings_) {
     timer_.stop();
   }
@@ -1776,39 +1861,86 @@ bool CCPADMMSolver<T>::_solve_impl(const ContactProblem<T, IceCreamCone> &prob,
   if (settings.timings_) {
     timer_.start();
   }
+
+  // =========================================================================
+  // STEP 1: Parameter & Variable Initialization
+  // =========================================================================
   max_iter_ = settings.max_iter_;
   th_stop_ = settings.th_stop_;
   rel_th_stop_ = settings.rel_th_stop_;
-  lam2_ = lam0;
-  lam_ = lam0;
-  gamma_ = gamma0;
-  R_reg_ = R_reg;
+  lam2_ = lam0; // Initialize Primal Variable 1 (Global System Dynamics)
+  lam_ = lam0;  // Initialize Primal Variable 2 (Cone Constrained Forces)
+  gamma_ = gamma0; // Initialize Dual Variable (Lagrange Multipliers / Contact Slip)
+  R_reg_ = R_reg; // Proximal regularization vector
   if (settings.statistics_) {
     stats_.reset();
   }
-  rho_ = rho_admm;
+
+  // ---------------------------------------------------------------------
+  // STEP 1.1: ADMM Penalty Multiplier and Cholesky Pre-factorization
+  // ---------------------------------------------------------------------
+  rho_ = rho_admm; // ADMM step size / penalty parameter
+
+  // Combine material compliance (R_comp), proximal regularization (R_reg), and ADMM penalties (rho_ + rho)
+  // This acts as a regularized diagonal modification to ensure strict convexity.
   rhos_ = (prob.R_comp_.array() + R_reg_.array() + rho_ + rho).matrix();
-  prob.Del_->updateChol(rhos_);
+  prob.Del_->updateChol(rhos_); // Update Cholesky factorization of the regularized Delassus matrix (W + diag(rhos))
 
   stop_ = std::numeric_limits<T>::max();
+
+  // =========================================================================
+  // STEP 2: Main ADMM Iteration Loop
+  // =========================================================================
   for (int j = 0; j < max_iter_; j++) {
-    lam2_pred_ = lam2_;
+    lam2_pred_ = lam2_; // Save previous step states for residual and convergence checks
+    lam_pred_  = lam_;
     lam_pred_ = lam_;
+    // ---------------------------------------------------------------------
+    // STEP 2.1: Global Step (Primal Update 1 - Minimizing Unconstrained System)
+    // ---------------------------------------------------------------------
     if (settings.statistics_) {
+      // Extended version with statistics tracking: explicitly computes contact velocities (v = W * lam2 + g)
       prob.Del_->applyOnTheRight(lam2_, v_);
       v_ += prob.g_;
       v_reg_ = v_ + R_reg_.cwiseProduct(lam2_);
       v_reg_ += prob.R_comp_.cwiseProduct(lam2_);
+
+      // Formulate the right-hand side of the regularized linear system
       lam2_ = -(v_reg_ + gamma_ + rho_ * (lam2_pred_ - lam_));
-      prob.Del_->solveInPlace(lam2_);
+      prob.Del_->solveInPlace(lam2_); // Solve the global coupled system using the pre-computed Cholesky factor
       lam2_ += lam2_pred_;
     } else {
+      // Optimized branch for raw computation speed without intermediate velocity logging
+      // Solves: lam2 = (W + diag(rhos))^-1 * (-g - gamma + rho_*lam + rho*lam2_pred)
       lam2_ = -(prob.g_ + gamma_ - rho_ * lam_ - rho * lam2_pred_);
       prob.Del_->solveInPlace(lam2_);
     }
+    // ---------------------------------------------------------------------
+    // STEP 2.2: Over-Relaxation Step
+    // ---------------------------------------------------------------------
+    // Implements the over-relaxation technique.
+    // Blends the new 'lam2_' with the old 'lam_pred_' and adds the scaled dual variable.
+    // This accelerates convergence rates significantly.
     lam_or_ = over_relax * lam2_ + (1 - over_relax) * lam_pred_ + gamma_ / rho_;
+
+    // ---------------------------------------------------------------------
+    // STEP 2.3: Local Step (Primal Update 2 - Second-Order Cone Projection)
+    // ---------------------------------------------------------------------
+    // Projects the over-relaxed auxiliary impulse vector 'lam_or_' onto the physical friction cone.
+    // This forces 'lam_' to strictly satisfy Coulomb's law.
     prob.project(lam_or_, lam_);
+
+    // ---------------------------------------------------------------------
+    // STEP 2.4: Dual Step (Lagrange Multiplier / Dual Variable Update)
+    // ---------------------------------------------------------------------
+    // Update the dual variables based on the constraint violation (mismatch between the steps)
+    // Formula: gamma = gamma + rho * (lam_or - lam)
     gamma_ = rho_ * (lam_or_ - lam_);
+
+    // =========================================================================
+    // STEP 3: Convergence Evaluation & Statistics Tracking
+    // =========================================================================
+    // Stopping criteria maps directly to primal and dual residuals described in the paper's benchmark section.
     stop_ = stoppingCriteria(prob, lam2_, lam2_pred_, lam_, lam_pred_, gamma_,
                              rho_, rho);
     rel_stop_ = relativeStoppingCriteria(lam2_, lam2_pred_);
@@ -1817,6 +1949,8 @@ bool CCPADMMSolver<T>::_solve_impl(const ContactProblem<T, IceCreamCone> &prob,
       addStatistics(stop_, rel_stop_, comp_reg_, prim_feas_, dual_feas_,
                     sig_comp_, ncp_comp_);
     }
+
+    // Early exit if the solver falls below specified precision thresholds
     if (stop_ < th_stop_ || rel_stop_ < rel_th_stop_) {
       n_iter_ = j + 1;
       CONTACTBENCH_NOMALLOC_END;
@@ -1825,14 +1959,22 @@ bool CCPADMMSolver<T>::_solve_impl(const ContactProblem<T, IceCreamCone> &prob,
       }
       return true;
     }
+
+    // ---------------------------------------------------------------------
+    // STEP 4: Adaptive Step Size Tuning (Dynamic Rho Update)
+    // ---------------------------------------------------------------------
+    // If primal feasibility (kinematic alignment) and dual feasibility (force alignment)
+    // are imbalanced, 'updateRho' dynamically changes the penalty parameter 'rho_'.
     bool new_rho = updateRho(prim_feas_, dual_feas_reg_, rho_); // TODO
     if (new_rho) {
+      // Recompute regularized terms and update Cholesky factors on-the-fly for the next iteration
       rhos_ = (prob.R_comp_.array() + R_reg_.array() + rho_ + rho).matrix();
       prob.Del_->updateChol(rhos_);
     }
   }
   n_iter_ = max_iter_;
   CONTACTBENCH_NOMALLOC_END;
+  // Solver reached maximum iterations without falling below the convergence tolerances
   if (settings.timings_) {
     timer_.stop();
   }
@@ -2667,34 +2809,71 @@ bool CCPNewtonPrimalSolver<T>::_solve_impl(
   if (settings.timings_) {
     timer_.start();
   }
+
+  // =========================================================================
+  // STEP 1: Initialization of Parameters and Variables
+  // =========================================================================
   max_iter_ = settings.max_iter_;
   th_stop_ = settings.th_stop_;
   rel_th_stop_ = settings.rel_th_stop_;
   if (settings.statistics_) {
     stats_.reset();
   }
-  dq_ = dq0;
-  cost_ = unconstrainedCost(prob, R_reg_, dq_);
+  dq_ = dq0; // Initialize the primal decision variable: generalized velocities (q dot)
+  cost_ = unconstrainedCost(prob, R_reg_, dq_); // Compute the initial cost function value
+
+  // =========================================================================
+  // STEP 2: Main Newton-Raphson Iteration Loop
+  // =========================================================================
   for (int j = 0; j < max_iter_; j++) {
-    dq_pred_ = dq_;
+    dq_pred_ = dq_;// Store the velocity of the previous iteration to check relative convergence
+
+    // ---------------------------------------------------------------------
+    // STEP 2.1: First and Second-Order Derivatives Evaluation
+    // ---------------------------------------------------------------------
+    // Compute the Gradient vector (first derivative).
+    // Also extracts auxiliary variables 'y_' and the resulting contact forces 'lam_'.
     computeGrad(prob, R_reg_, dq_, y_, lam_, grad_);
+
+    // Compute the Hessian matrix (second derivative, H_).
+    // This represents the local curvature of the energy/cost landscape.
     computeHess(prob, R_reg_, dq_, y_, y_tilde_, H_);
+
+    // ---------------------------------------------------------------------
+    // STEP 2.2: Descent Direction Computation
+    // ---------------------------------------------------------------------
+    // Solves the Newton system: H_ * ddq_ = -grad_ to get the search direction 'ddq_'
     computeDescentDirection(grad_, H_, ddq_);
-    // Linesearch
+    // ---------------------------------------------------------------------
+    // STEP 2.3: Backtracking Linesearch (Armijo Condition)
+    // ---------------------------------------------------------------------
+    // Iteratively shrinks the step size 'alpha_' to guarantee a sufficient decrease
+    // in the cost function, preventing overshoot caused by the strong non-linearities.
     alpha_ = 1.25;
-    double exp_dec = 1e-4 * alpha_ * grad_.dot(ddq_);
+    double exp_dec = 1e-4 * alpha_ * grad_.dot(ddq_); // Expected decrease threshold
     for (int k = 0; k < max_iter_; k++) {
-      dq_try_ = dq_ + alpha_ * ddq_;
-      cost_try_ = unconstrainedCost(prob, R_reg_, dq_try_);
+      dq_try_ = dq_ + alpha_ * ddq_; // Compute trial velocities
+      cost_try_ = unconstrainedCost(prob, R_reg_, dq_try_); // Compute trial cost
+
+      // If the Armijo condition is met, accept the step size
       if (cost_try_ < cost_ + exp_dec) {
         break;
       } else {
+        // Backtracking: shrink step size alpha and update expected decrease
         alpha_ *= 0.8;
         exp_dec *= 0.8;
       }
     }
+
+    // Update the system state with the accepted line search step
     dq_ = dq_try_;
     cost_ = cost_try_;
+
+    // =========================================================================
+    // STEP 3: Convergence & Termination Criteria Evaluation
+    // =========================================================================
+    // Compute the infinity norm of the gradient (scaled by the mass matrix diagonal)
+    // to verify if the system has reached a stationary minimum (optimality).
     stop_ = (grad_.array() / M_diag_sqrt_.array())
                 .matrix()
                 .template lpNorm<Infinity>();
@@ -2705,6 +2884,7 @@ bool CCPNewtonPrimalSolver<T>::_solve_impl(
       addStatistics(stop_, rel_stop_, comp_reg_, sig_comp_reg_, ncp_comp_reg_,
                     prim_feas_, dual_feas_reg_, cost_);
     }
+    // Early exit if the gradient or relative velocity changes drop below thresholds
     if (stop_ < th_stop_ || rel_stop_ < rel_th_stop_) {
       CONTACTBENCH_NOMALLOC_END;
       if (settings.timings_) {
@@ -2714,6 +2894,7 @@ bool CCPNewtonPrimalSolver<T>::_solve_impl(
     }
   }
   CONTACTBENCH_NOMALLOC_END;
+  // Solver reached maximum iterations without satisfying convergence criteria
   if (settings.timings_) {
     timer_.stop();
   }
@@ -3146,46 +3327,88 @@ bool RaisimSolver<T>::solve(const ContactProblem<T, IceCreamCone> &prob,
   if (settings.timings_) {
     timer_.start();
   }
-  alpha_ = alpha;
-  alpha_min_ = alpha_min;
-  beta1_ = beta1;
-  beta2_ = beta2;
-  beta3_ = beta3;
-  gamma_ = gamma;
-  th_ = th;
+
+  // =========================================================================
+  // STEP 1: RaiSim Hyperparameter & State Initialization
+  // =========================================================================
+  alpha_ = alpha; // Initial relaxation/step size factor
+  alpha_min_ = alpha_min; // Minimum floor for alpha relaxation decay
+  beta1_ = beta1; // Bisection tuning parameter 1
+  beta2_ = beta2; // Bisection tuning parameter 2
+  beta3_ = beta3; // Bisection tuning parameter 3
+  gamma_ = gamma; // Decay rate for the alpha update schedule
+  th_ = th; // Precision threshold for the inner bisection loop
   th_stop_ = settings.th_stop_;
   rel_th_stop_ = settings.rel_th_stop_;
   max_iter_ = settings.max_iter_;
   stop_ = std::numeric_limits<T>::max();
-  lam_ = lam0;
+  lam_ = lam0; // Initialize contact impulse vector lambda
   if (settings.statistics_) {
     stats_.reset();
   }
+
+  // =========================================================================
+  // STEP 2: Matrix Prep & Local Coordinate Initialization
+  // =========================================================================
   prob.Del_->computeChol(1e-9);
   prob.Del_->evaluateDel();
-  computeGinv(prob.Del_->G_);
-  computeC(prob.Del_->G_, prob.g_, lam_);
+  // RaiSim specific precomputations:
+  computeGinv(prob.Del_->G_); // Precompute block-inverse or diagonal properties of G
+  computeC(prob.Del_->G_, prob.g_, lam_); // Initialize the local contact velocity/acceleration context vector c
   Vector3s lam_star, lam_v0;
+  // =========================================================================
+  // STEP 3: Main Fixed-Point Iteration Loop (Coordinate Descent style)
+  // =========================================================================
   for (int i = 0; i < max_iter_; i++) {
-    lam_pred_ = lam_;
+    lam_pred_ = lam_; // Track previous impulses for relative convergence checks
+    // De-coupled sequential loop over each single contact point j
     for (int j = 0; j < nc_; j++) {
+      // Calculate the unconstrained ideal local contact impulse lam_v0 assuming no boundaries
       computeLamV0(Ginv_.template middleCols<3>(3 * j), c_.col(j), lam_v0);
-      T muj = prob.contact_constraints_[CAST_UL(j)].mu_;
+      T muj = prob.contact_constraints_[CAST_UL(j)].mu_; // Local friction coefficient mu
+
+      // ---------------------------------------------------------------------
+      // STEP 3.1: Explicit Kinematic & Friction State Classification
+      // ---------------------------------------------------------------------
+
+      // CASE 1: Opening Contact
+      // The normal velocity component c_z is positive, meaning the bodies are separating.
       if (c_.col(j)(2) > 0) { // opening contact
-        lam_.template segment<3>(3 * j) *= 1 - alpha_;
+        lam_.template segment<3>(3 * j) *= 1 - alpha_; // Slowly damp/decay the contact force down towards zero using the alpha relaxation
+
+        // CASE 2: Sticking Contact
+        // Check if the unconstrained 3D impulse solution lies inside the Coulomb friction cone:
+        // Condition: lambda_n * mu >= ||lambda_t||
       } else if (lam_v0(2) * muj >=
                  lam_v0.template head<2>().norm()) { // sticking contact
+        // Partially blend the old impulse with the new ideal unconstrained sticking solution
         lam_.template segment<3>(3 * j) *= 1 - alpha_;
         lam_.template segment<3>(3 * j) += alpha_ * lam_v0;
+        // CASE 3: Sliding Contact
+        // The unconstrained force violates the cone boundary. Friction limits are active.
       } else { // sliding contact
         lam_.template segment<3>(3 * j) *= 1 - alpha_;
+
+        // Execute an optimized numerical bisection search to find the exact crossing point
+        // 'lam_star' where the unconstrained direction intersects the non-linear friction cone manifold.
         bisectionStep(prob.Del_->G_.template block<3, 3>(3 * j, 3 * j),
                       Ginv_.template middleCols<3>(3 * j), c_.col(j), muj,
                       lam_v0, lam_star, max_iter_, th_, beta1_, beta2_, beta3_);
+        // Relax the current contact impulse towards the newly found valid cone boundary point
         lam_.template segment<3>(3 * j) += alpha_ * lam_star;
       }
+
+      // ---------------------------------------------------------------------
+      // STEP 3.2: Local Context Refresh
+      // ---------------------------------------------------------------------
+      // Update the velocity context vector c for contact j to propagate the changes
+      // immediately to the next contact checks within the same loop.
       updateC(j, prob.Del_->G_, prob.g_, lam_.template segment<3>(3 * j));
     }
+
+    // =========================================================================
+    // STEP 4: Convergence Monitoring & Alpha Scheduling
+    // =========================================================================
     stop_ = stoppingCriteria(prob, lam_, v_);
     rel_stop_ = relativeStoppingCriteria(lam_, lam_pred_);
     if (settings.statistics_) {
@@ -3193,6 +3416,8 @@ bool RaisimSolver<T>::solve(const ContactProblem<T, IceCreamCone> &prob,
       addStatistics(stop_, rel_stop_, comp_, sig_comp_, ncp_comp_, prim_feas_,
                     dual_feas_);
     }
+
+    // Exit early if the residuals meet the precision thresholds
     if (stop_ < th_stop_ || rel_stop_ < rel_th_stop_) {
       n_iter_ = i + 1;
       CONTACTBENCH_NOMALLOC_END;
@@ -3201,10 +3426,12 @@ bool RaisimSolver<T>::solve(const ContactProblem<T, IceCreamCone> &prob,
       }
       return true;
     }
+    // Momentum / Step-size decay: Gradually cool down alpha to freeze out numerical oscillations
     alpha_ = (1. - gamma_) * alpha_min_ + gamma_ * alpha_;
   }
   n_iter_ = max_iter_;
   CONTACTBENCH_NOMALLOC_END;
+  // Finished all iterations without fully converging below thresholds
   if (settings.timings_) {
     timer_.stop();
   }
